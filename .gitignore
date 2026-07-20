@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+
+# Virtual environment
+venv/
+
+# Editor
+.vscode/
+.idea/
+
+async_function.py
