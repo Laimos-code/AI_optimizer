@@ -3,9 +3,9 @@ load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Literal
 from sqlalchemy import desc
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -49,6 +49,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(SQLAlchemyError)
 async def db_exception_handler(request: Request, exc: SQLAlchemyError):
+    print("DB ERROR:", repr(exc))
     return JSONResponse(
         status_code=500,
         content={
@@ -84,8 +85,44 @@ class APICallResponse(BaseModel):
         from_attributes = True
 
 class AlertRuleCreate(BaseModel):
-    metric: str
+    metric: Literal["spend"]= "spend"
     threshold: float = Field(gt=0)
+    period: Literal["daily", "weekend", "monthly"]= "daily"
+    scope_type: Optional[Literal["model", "provider"]]= None
+    scope_value: Optional[str]=None
+    channel: Literal["slack", "email"]
+    target: str= Field(min_length=3)
+
+    @model_validator(mode="after")
+    def scope_pair(self):
+        if(self.scope_value is None)!= (self.scope_type is None):
+            raise ValueError("scope_value and scope_type must both be set or both be omitted")
+        return self
+
+class AlertRuleResponse(BaseModel):
+    id: int
+    metric: str
+    threshold: float
+    period: str
+    scope_type: Optional[str] = None
+    scope_value: Optional[str] = None
+    channel: str
+    target: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True   
+
+class AlertRuleUpdate(BaseModel):
+    threshold: Optional[float] = Field(default=None, gt=0)
+    period: Optional[Literal["daily", "weekly", "monthly"]] = None
+    scope_type: Optional[Literal["model", "provider"]] = None
+    scope_value: Optional[str] = None
+    channel: Optional[Literal["slack", "email"]] = None
+    target: Optional[str] = Field(default=None, min_length=3)
+    is_active: Optional[bool] = None 
+
     
 # --- key function ---
 def require_admin(x_admin_secret: str = Header(...)):
@@ -110,7 +147,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "1.0"}
+    return {"status": "healthy", "version": "1.1"}
 
 @app.post("/log-call", response_model=APICallResponse)
 def log_api_call(call: APICallLog, db: Session = Depends(get_db), _: APIKey = Depends(require_api_key)):
@@ -178,7 +215,7 @@ def create_api_key(name: str, _: None=Depends(require_admin), db: Session = Depe
 
 @app.get("/logs/filter")
 def filter_logs(
-    provider: Optional[str]=None,
+    provider: Optional[str]=None,   
     model: Optional[str]= None,
     start_date: Optional[datetime]= None,
     end_date: Optional[datetime]= None,
@@ -256,7 +293,7 @@ def cost_breakdown(db: Session = Depends(get_db), _: APIKey = Depends(require_ap
         if log.provider not in breakdown:
             breakdown[log.provider] = 0.0
         breakdown[log.provider] += log.cost
-    return {"cost_by_provider": breakdown}
+    return {"cost_by_provider": {k: round(v, 2) for k, v in breakdown.items()}}
 
 @app.get("/analysis/cost-by-feature")
 def cost_by_feature(db: Session = Depends(get_db), _: APIKey = Depends(require_api_key)):
@@ -282,3 +319,64 @@ def peak_hours(db: Session = Depends(get_db), _: APIKey = Depends(require_api_ke
         hours[hour] += 1
     sorted_hours = dict(sorted(hours.items(), key=lambda x: x[1], reverse=True))
     return {"peak_hours": sorted_hours}
+
+@app.post("/alerts/rules", response_model= AlertRuleResponse, status_code=201)
+def create_alert_rule(rule: AlertRuleCreate, db: Session=Depends(get_db), _: APIKey= Depends(require_api_key)):
+    db_rule=AlertRule(**rule.model_dump())
+    db.add(db_rule)
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule                                              # here return db_rule is written rather than the whole db_rule like it is written in log-call because log call does not have same attributes as the input json(total_tokens in extra in APICallresponse)
+
+@app.get("/alerts/rules", response_model=list[AlertRuleResponse])
+def list_alert_rules(is_active: Optional[bool] = None, db: Session = Depends(get_db), _: APIKey = Depends(require_api_key)):
+    query= db.query(AlertRule)
+    if is_active is not None:
+        query = query.filter(AlertRule.is_active == is_active)
+    return query.order_by(desc(AlertRule.created_at)).all()
+
+@app.get("/alerts/rules/{rule_id}", response_model=AlertRuleResponse)
+def get_alert_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    _: APIKey = Depends(require_api_key)
+):
+    rule = db.query(AlertRule).filter(AlertRule.id == rule_id).first()
+    if rule is None:
+        raise HTTPException(status_code=404, detail="Alert rule not found")
+    return rule
+
+@app.patch("/alerts/rules/{rule_id}", response_model=AlertRuleResponse)
+def update_alert_rule(
+    rule_id: int,
+    update: AlertRuleUpdate,
+    db: Session = Depends(get_db),
+    _: APIKey = Depends(require_api_key)
+):
+    rule = db.query(AlertRule).filter(AlertRule.id == rule_id).first()
+    if rule is None:
+        raise HTTPException(status_code=404, detail="Alert rule not found")
+
+    data = update.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    for field, value in data.items():
+        setattr(rule, field, value)
+
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@app.delete("/alerts/rules/{rule_id}", status_code=204)
+def delete_alert_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    _: APIKey = Depends(require_api_key)
+):
+    rule = db.query(AlertRule).filter(AlertRule.id == rule_id).first()
+    if rule is None:
+        raise HTTPException(status_code=404, detail="Alert rule not found")
+    db.delete(rule)
+    db.commit()
