@@ -13,3 +13,4 @@ venv/
 .idea/
 
 async_function.py
+api_keys.txt

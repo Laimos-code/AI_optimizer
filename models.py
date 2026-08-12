@@ -21,7 +21,7 @@ class APIKey(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     key_hash = Column(String, unique=True, nullable=False, index=True)
-    prefix = Column(String, nullable=False)
+    key_prefix = Column(String, nullable=False)
     name = Column(String, nullable=False)          # human label e.g. "my-app"
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)) 

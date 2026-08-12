@@ -9,9 +9,8 @@ from typing import Optional
 from sqlalchemy import desc
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-import secrets
-from models import APICall, APIKey, Base
-import hashlib, secrets
+from models import APICall, APIKey, Base, AlertRule, TriggeredAlert
+import hashlib, secrets, os
     
 from database import get_db, engine
 print("DATABASE URL:", engine.url)
@@ -19,6 +18,9 @@ print("DATABASE URL:", engine.url)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AI Optimizer", version="1.0")
+ADMIN_SECRET= os.environ["ADMIN_SECRET"]
+def hash_key(raw:str):
+    return hashlib.sha256(raw.encode()).hexdigest() 
 
 # --- Exception Handlers ---
 
@@ -86,9 +88,14 @@ class AlertRuleCreate(BaseModel):
     threshold: float = Field(gt=0)
     
 # --- key function ---
+def require_admin(x_admin_secret: str = Header(...)):
+    if not secrets.compare_digest(x_admin_secret, ADMIN_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
+    
 def require_api_key(x_api_key: str = Header(...), db: Session = Depends(get_db)):
+    key_hash= hash_key(x_api_key)
     db_key = db.query(APIKey).filter(
-        APIKey.key == x_api_key,
+        APIKey.key_hash == key_hash,
         APIKey.is_active == True
     ).first()
     if db_key is None:
@@ -159,13 +166,15 @@ def summary(db: Session = Depends(get_db), _: APIKey=Depends(require_api_key)):
     }
 
 @app.post("/api-keys")
-def create_api_key(name: str, db: Session = Depends(get_db)):
-    raw_key = secrets.token_hex(32)   # 64-character random string
-    db_key = APIKey(key=raw_key, name=name)
+def create_api_key(name: str, _: None=Depends(require_admin), db: Session = Depends(get_db)):
+    raw_key ="aio"+ secrets.token_urlsafe(32)   # 64-character random string
+    db_key = APIKey(key_hash=hash_key(raw_key),
+                    key_prefix=raw_key[:12],
+                         name=name)
     db.add(db_key)
     db.commit()
     db.refresh(db_key)
-    return {"key": raw_key, "name": name, "id": db_key.id}
+    return {"key": raw_key, "name": name, "id": db_key.id} # raw key shown exactly once
 
 @app.get("/logs/filter")
 def filter_logs(
