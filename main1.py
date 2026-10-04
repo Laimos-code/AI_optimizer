@@ -6,19 +6,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from datetime import datetime, timezone
 from typing import Optional, Literal
-from sqlalchemy import desc
+from sqlalchemy import desc,  text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from models import APICall, APIKey, Base, AlertRule, TriggeredAlert
 import hashlib, secrets, os
     
 from database import get_db, engine
-print("DATABASE URL:", engine.url)
+
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AI Optimizer", version="1.0")
-ADMIN_SECRET= os.environ["ADMIN_SECRET"]
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+if not ADMIN_SECRET:
+    raise RuntimeError("ADMIN_SECRET is not set — add it to your .env file")
 def hash_key(raw:str):
     return hashlib.sha256(raw.encode()).hexdigest() 
 
@@ -87,7 +89,7 @@ class APICallResponse(BaseModel):
 class AlertRuleCreate(BaseModel):
     metric: Literal["spend"]= "spend"
     threshold: float = Field(gt=0)
-    period: Literal["daily", "weekend", "monthly"]= "daily"
+    period: Literal["daily", "weekly", "monthly"]= "daily"
     scope_type: Optional[Literal["model", "provider"]]= None
     scope_value: Optional[str]=None
     channel: Literal["slack", "email"]
@@ -148,6 +150,14 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "healthy", "version": "1.1"}
+
+@app.get("/health/ready")
+def health(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"status": "ready"}
 
 @app.post("/log-call", response_model=APICallResponse)
 def log_api_call(call: APICallLog, db: Session = Depends(get_db), _: APIKey = Depends(require_api_key)):
@@ -276,13 +286,19 @@ def expensive_model(db: Session= Depends(get_db), _: APIKey=Depends(require_api_
         breakdown[log.model]["total_tokens"]+= log.input_tokens+log.output_tokens
 
     for model in breakdown:
-        total_cost= breakdown[model]["total_cost"]
-        total_tokens= breakdown[model]["total_tokens"]
-        breakdown[model]["expensive"]= total_tokens/total_cost
+        total_cost = breakdown[model]["total_cost"]
+        total_tokens = breakdown[model]["total_tokens"]
+        breakdown[model]["cost_per_token"] = (
+            total_cost / total_tokens if total_tokens else 0.0
+        )
 
-    highest= max(breakdown, key=lambda model: breakdown[model]["expensive"])
+    if not breakdown:
+        return {"most_expensive_model": None}
+
+    highest = max(breakdown, key=lambda model: breakdown[model]["cost_per_token"])
     return {
-        "most_expensive_model": highest
+        "most_expensive_model": highest,
+        "cost_per_token": breakdown[highest]["cost_per_token"]
     }
 
 @app.get("/analysis/cost-breakdown")
