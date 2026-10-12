@@ -16,6 +16,12 @@ class APICall(Base):
     feature_name = Column(String, nullable=True)
     timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+    api_key_id      = Column(Integer, ForeignKey("api_keys.id"), nullable=True, index=True)
+    source          = Column(String, nullable=False, default="reported")  # "proxy" | "reported"
+    requested_model = Column(String, nullable=True)
+    latency_ms      = Column(Integer, nullable=True)
+    status_code     = Column(Integer, nullable=True)
+    
 class APIKey(Base):
     __tablename__ = "api_keys"
 

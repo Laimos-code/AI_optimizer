@@ -6,7 +6,6 @@
 # cost math testable. Replace them from:
 #   Groq:   https://groq.com/pricing/
 #   Gemini: https://ai.google.dev/pricing
-# Then run: python scripts/sync_pricing.py
 
 import re
 

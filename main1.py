@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
+from database import get_db, engine
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -7,23 +8,35 @@ from pydantic import BaseModel, Field, model_validator
 from datetime import datetime, timezone
 from typing import Optional, Literal
 from sqlalchemy import desc,  text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError  
 from sqlalchemy.orm import Session
 from models import APICall, APIKey, Base, AlertRule, TriggeredAlert
+from contextlib import asynccontextmanager
+from pricing import calculate_cost, normalize_model, UnknownModelError, PRICING
 import hashlib, secrets, os
-    
-from database import get_db, engine
-
+import time, httpx
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="AI Optimizer", version="1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.Client(
+        timeout=httpx.Timeout(connect=5.0, read=180.0, write=10.0, pool=5.0)
+    )
+    yield
+    app.state.http.close()
+app = FastAPI(title="AI Optimizer", version="1.0", lifespan=lifespan)
+
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
 if not ADMIN_SECRET:
     raise RuntimeError("ADMIN_SECRET is not set — add it to your .env file")
-def hash_key(raw:str):
-    return hashlib.sha256(raw.encode()).hexdigest() 
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set — add it to your .env file") 
+
+def hash_key(raw:str):
+    return hashlib.sha256(raw.encode()).hexdigest()
 # --- Exception Handlers ---
 
 @app.exception_handler(HTTPException)
@@ -61,6 +74,12 @@ async def db_exception_handler(request: Request, exc: SQLAlchemyError):
         }
     )
 
+def openai_error(status: int, message: str, err_type: str = "invalid_request_error"):
+    """Errors from /v1/* must match OpenAI's shape so client SDKs parse them."""
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": err_type, "code": None}},
+    )
 # --- Pydantic Models ---
 
 class APICallLog(BaseModel):
@@ -396,3 +415,81 @@ def delete_alert_rule(
         raise HTTPException(status_code=404, detail="Alert rule not found")
     db.delete(rule)
     db.commit()
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+@app.post("/v1/chat/completions")
+def chat_completions(
+    body: dict,
+    request: Request,
+    db: Session = Depends(get_db),
+    key: APIKey = Depends(require_api_key),
+):
+    if body.get("stream"):
+        return openai_error(400, "Streaming is not supported yet")
+
+    model = body.get("model")
+    if not model:
+        return openai_error(400, "Missing required field: 'model'")
+
+    try:
+        canonical = normalize_model(model)
+    except UnknownModelError as e:
+        return openai_error(400, str(e), "model_not_found")
+
+    if PRICING[canonical]["provider"] != "groq":
+        return openai_error(400, f"Provider for {model!r} is not supported yet")
+
+    client: httpx.Client = request.app.state.http
+    started = time.monotonic()
+    try:
+        upstream = client.post(
+            GROQ_URL,
+            json=body,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        )
+    except httpx.RequestError as e:
+        return openai_error(502, f"Could not reach upstream provider: {e}", "api_error")
+    latency_ms = int((time.monotonic() - started) * 1000)
+
+    if upstream.status_code != 200:
+        return JSONResponse(status_code=upstream.status_code, content=upstream.json())
+
+    data = upstream.json()
+    usage = data.get("usage", {})
+    input_tokens = usage.get("prompt_tokens", 0)
+    output_tokens = usage.get("completion_tokens", 0)
+    resolved_model = data.get("model", model)
+
+    try:
+        cost = calculate_cost(resolved_model, input_tokens, output_tokens)
+    except UnknownModelError:
+        cost = 0.0
+
+    db.add(APICall(
+        api_key_id=key.id,
+        source="proxy",
+        provider="groq",
+        model=resolved_model,
+        requested_model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost=cost,
+        latency_ms=latency_ms,
+        status_code=upstream.status_code,
+        feature_name=(body.get("metadata") or {}).get("feature"),
+        timestamp=datetime.now(timezone.utc),
+    ))
+    db.commit()
+
+    return data
+
+@app.get("/v1/models")
+def list_models(_: APIKey = Depends(require_api_key)):
+    return {
+        "object": "list",
+        "data": [
+            {"id": name, "object": "model", "created": 0, "owned_by": info["provider"]}
+            for name, info in PRICING.items()
+        ],
+    }
